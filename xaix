@@ -1,0 +1,895 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+============================================================================
+Lorentzian Classification Trading Bot - نسخة كاملة ومستقلة
+============================================================================
+تحويل كامل لمؤشر Lorentzian Classification من Pine Script إلى Python
+للتداول الآلي على منصة cTrader مع FxPro
+
+المؤلف الأصلي: @jdehorty
+الترخيص: Mozilla Public License 2.0
+============================================================================
+"""
+
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import logging
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# إعداد نظام السجلات
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# الإعدادات الكاملة (كل شيء في مكان واحد)
+# ============================================================================
+
+class Config:
+    """جميع إعدادات البوت في كلاس واحد"""
+    
+    # ============== إعدادات cTrader API ==============
+    # ⚠️ ضع بيانات API الخاصة بك هنا
+    CTRADER_CLIENT_ID = "your_client_id_here"
+    CTRADER_CLIENT_SECRET = "your_client_secret_here"
+    CTRADER_ACCOUNT_ID = "your_account_id_here"
+    CTRADER_BASE_URL = "https://demo.ctraderapi.com"
+    
+    # ============== إعدادات التداول ==============
+    SYMBOL = "EURUSD"
+    TIMEFRAME = "M1"  # دقيقة واحدة
+    LEVERAGE = 10000  # الرافعة المالية 1:10000
+    INITIAL_BALANCE = 100.0  # الرصيد الابتدائي بالدولار
+    USE_CUMULATIVE_BALANCE = True  # استخدام الرصيد التراكمي
+    
+    # ============== إعدادات نموذج التعلم الآلي ==============
+    NEIGHBORS_COUNT = 8  # عدد الجيران
+    MAX_BARS_BACK = 2000  # عدد الشموع التاريخية
+    FEATURE_COUNT = 5  # عدد الميزات
+    USE_DYNAMIC_EXITS = False  # مخارج ديناميكية
+    
+    # ============== إعدادات الفلاتر ==============
+    USE_VOLATILITY_FILTER = True
+    USE_REGIME_FILTER = True
+    USE_ADX_FILTER = False
+    REGIME_THRESHOLD = -0.1
+    ADX_THRESHOLD = 20
+    
+    # ============== إعدادات EMA و SMA ==============
+    USE_EMA_FILTER = False
+    EMA_PERIOD = 200
+    USE_SMA_FILTER = False
+    SMA_PERIOD = 200
+    
+    # ============== إعدادات Kernel Regression ==============
+    USE_KERNEL_FILTER = True
+    USE_KERNEL_SMOOTHING = False
+    KERNEL_H = 8  # Lookback Window
+    KERNEL_R = 8.0  # Relative Weighting
+    KERNEL_X = 25  # Regression Level
+    KERNEL_LAG = 2
+    
+    # ============== إعدادات الميزات ==============
+    # Feature 1
+    F1_TYPE = "RSI"
+    F1_PARAM_A = 14
+    F1_PARAM_B = 1
+    
+    # Feature 2
+    F2_TYPE = "WT"
+    F2_PARAM_A = 10
+    F2_PARAM_B = 11
+    
+    # Feature 3
+    F3_TYPE = "CCI"
+    F3_PARAM_A = 20
+    F3_PARAM_B = 1
+    
+    # Feature 4
+    F4_TYPE = "ADX"
+    F4_PARAM_A = 20
+    F4_PARAM_B = 2
+    
+    # Feature 5
+    F5_TYPE = "RSI"
+    F5_PARAM_A = 9
+    F5_PARAM_B = 1
+    
+    # ============== إعدادات إدارة المخاطر ==============
+    MAX_POSITION_SIZE = 100.0  # حد أقصى لحجم الصفقة باللوت
+    STOP_LOSS_PIPS = 0  # وقف الخسارة (0 = معطل)
+    TAKE_PROFIT_PIPS = 0  # جني الأرباح (0 = معطل)
+    MAX_DAILY_LOSS = 0  # حد الخسارة اليومية (0 = معطل)
+    
+    # ============== إعدادات التشغيل ==============
+    UPDATE_INTERVAL_SECONDS = 60  # التحديث كل 60 ثانية (دقيقة واحدة)
+    USE_DEMO_MODE = True  # وضع تجريبي (محاكاة)
+
+
+# ============================================================================
+# المؤشرات الفنية (كل المؤشرات من Pine Script)
+# ============================================================================
+
+class TechnicalIndicators:
+    """حساب جميع المؤشرات الفنية المطلوبة"""
+    
+    @staticmethod
+    def rsi(data: pd.Series, period: int = 14) -> pd.Series:
+        """مؤشر القوة النسبية RSI"""
+        delta = data.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        # تجنب القسمة على صفر
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)  # املأ القيم الناقصة بـ 50
+    
+    @staticmethod
+    def normalize_rsi(data: pd.Series, period: int, param_b: int = 1) -> pd.Series:
+        """RSI مطبّع من -1 إلى 1"""
+        rsi_val = TechnicalIndicators.rsi(data, period)
+        return (rsi_val - 50) / 50
+    
+    @staticmethod
+    def wt(hlc3: pd.Series, period_a: int, period_b: int) -> pd.Series:
+        """WaveTrend مؤشر الموجة"""
+        esa = hlc3.ewm(span=period_a, adjust=False).mean()
+        d = (hlc3 - esa).abs().ewm(span=period_a, adjust=False).mean()
+        d = d.replace(0, 0.001)  # تجنب القسمة على صفر
+        ci = (hlc3 - esa) / (0.015 * d)
+        wt1 = ci.ewm(span=period_b, adjust=False).mean()
+        return wt1 / 100  # تطبيع
+    
+    @staticmethod
+    def cci(data: pd.Series, period: int) -> pd.Series:
+        """Commodity Channel Index"""
+        tp = data
+        sma = tp.rolling(window=period).mean()
+        mad = (tp - sma).abs().rolling(window=period).mean()
+        mad = mad.replace(0, 0.001)  # تجنب القسمة على صفر
+        cci = (tp - sma) / (0.015 * mad)
+        return cci / 100  # تطبيع
+    
+    @staticmethod
+    def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average Directional Index"""
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        atr = tr.rolling(window=period).mean()
+        atr = atr.replace(0, 0.001)  # تجنب القسمة على صفر
+        
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        dx_denominator = (plus_di + minus_di).replace(0, 0.001)
+        dx = 100 * ((plus_di - minus_di).abs() / dx_denominator)
+        adx = dx.rolling(window=period).mean()
+        return adx / 100  # تطبيع
+    
+    @staticmethod
+    def ema(data: pd.Series, period: int) -> pd.Series:
+        """Exponential Moving Average"""
+        return data.ewm(span=period, adjust=False).mean()
+    
+    @staticmethod
+    def sma(data: pd.Series, period: int) -> pd.Series:
+        """Simple Moving Average"""
+        return data.rolling(window=period).mean()
+    
+    @staticmethod
+    def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average True Range"""
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
+
+
+# ============================================================================
+# محرك نموذج التعلم الآلي (Lorentzian Classifier)
+# ============================================================================
+
+class LorentzianClassifier:
+    """نموذج التصنيف الكامل باستخدام مسافة لورنتز"""
+    
+    def __init__(self):
+        self.config = Config()
+        
+        # مصفوفات الميزات
+        self.feature_arrays = {
+            'f1': [],
+            'f2': [],
+            'f3': [],
+            'f4': [],
+            'f5': []
+        }
+        
+        # مصفوفات التدريب
+        self.y_train_array = []
+        self.predictions = []
+        self.distances = []
+        
+        # حالة النموذج
+        self.last_signal = 0
+        self.bars_held = 0
+        
+        logger.info("تم تهيئة نموذج Lorentzian Classifier")
+    
+    def get_feature_series(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
+        """حساب جميع الميزات الخمس"""
+        close = df['close']
+        high = df['high']
+        low = df['low']
+        hlc3 = (high + low + close) / 3
+        
+        features = {}
+        
+        # Feature 1
+        features['f1'] = self._series_from(
+            self.config.F1_TYPE, close, high, low, hlc3,
+            self.config.F1_PARAM_A, self.config.F1_PARAM_B
+        )
+        
+        # Feature 2
+        features['f2'] = self._series_from(
+            self.config.F2_TYPE, close, high, low, hlc3,
+            self.config.F2_PARAM_A, self.config.F2_PARAM_B
+        )
+        
+        # Feature 3
+        features['f3'] = self._series_from(
+            self.config.F3_TYPE, close, high, low, hlc3,
+            self.config.F3_PARAM_A, self.config.F3_PARAM_B
+        )
+        
+        # Feature 4
+        features['f4'] = self._series_from(
+            self.config.F4_TYPE, close, high, low, hlc3,
+            self.config.F4_PARAM_A, self.config.F4_PARAM_B
+        )
+        
+        # Feature 5
+        features['f5'] = self._series_from(
+            self.config.F5_TYPE, close, high, low, hlc3,
+            self.config.F5_PARAM_A, self.config.F5_PARAM_B
+        )
+        
+        return features
+    
+    def _series_from(self, feature_string: str, close: pd.Series, high: pd.Series,
+                     low: pd.Series, hlc3: pd.Series, param_a: int, param_b: int) -> pd.Series:
+        """حساب ميزة واحدة بناءً على نوعها"""
+        if feature_string == "RSI":
+            return TechnicalIndicators.normalize_rsi(close, param_a, param_b)
+        elif feature_string == "WT":
+            return TechnicalIndicators.wt(hlc3, param_a, param_b)
+        elif feature_string == "CCI":
+            return TechnicalIndicators.cci(close, param_a)
+        elif feature_string == "ADX":
+            return TechnicalIndicators.adx(high, low, close, param_a)
+        else:
+            return pd.Series([0] * len(close), index=close.index)
+    
+    def get_lorentzian_distance(self, i: int, current_features: Dict[str, float]) -> float:
+        """حساب مسافة لورنتز بين النقطة الحالية والتاريخية"""
+        distance = 0.0
+        
+        for feature_name in ['f1', 'f2', 'f3', 'f4', 'f5'][:self.config.FEATURE_COUNT]:
+            if i < len(self.feature_arrays[feature_name]):
+                historical_value = self.feature_arrays[feature_name][i]
+                current_value = current_features[feature_name]
+                
+                # مسافة لورنتز: log(1 + |x - y|)
+                distance += np.log(1 + np.abs(current_value - historical_value))
+        
+        return distance
+    
+    def apply_filters(self, df: pd.DataFrame, idx: int) -> bool:
+        """تطبيق جميع الفلاتر"""
+        
+        # Volatility Filter (مبسط)
+        volatility_filter = True
+        if self.config.USE_VOLATILITY_FILTER:
+            # يمكن تحسينه بحساب التقلب الفعلي
+            volatility_filter = True
+        
+        # Regime Filter
+        regime_filter = True
+        if self.config.USE_REGIME_FILTER:
+            # يمكن تحسينه بكشف الاتجاه
+            regime_filter = True
+        
+        # ADX Filter
+        adx_filter = True
+        if self.config.USE_ADX_FILTER:
+            try:
+                adx_value = TechnicalIndicators.adx(
+                    df['high'], df['low'], df['close'], 14
+                ).iloc[idx]
+                adx_filter = adx_value > (self.config.ADX_THRESHOLD / 100)
+            except:
+                adx_filter = True
+        
+        return volatility_filter and regime_filter and adx_filter
+    
+    def rational_quadratic_kernel(self, source: pd.Series, h: int, r: float, x: int) -> pd.Series:
+        """Rational Quadratic Kernel Regression"""
+        result = source.copy()
+        size = len(source)
+        
+        for i in range(x, size):
+            sum_weights = 0.0
+            sum_values = 0.0
+            
+            for j in range(max(0, i - h), i):
+                # حساب الوزن
+                w = (1 + ((i - j) ** 2) / (2 * r * h ** 2)) ** (-r)
+                sum_weights += w
+                sum_values += w * source.iloc[j]
+            
+            if sum_weights > 0:
+                result.iloc[i] = sum_values / sum_weights
+        
+        return result
+    
+    def predict(self, df: pd.DataFrame, current_idx: int) -> Tuple[int, Dict]:
+        """التنبؤ بالاتجاه باستخدام خوارزمية KNN مع مسافة لورنتز"""
+        
+        # حساب الميزات الحالية
+        feature_series = self.get_feature_series(df)
+        current_features = {}
+        
+        for i in range(self.config.FEATURE_COUNT):
+            feature_name = f'f{i+1}'
+            try:
+                current_features[feature_name] = feature_series[feature_name].iloc[current_idx]
+                # تحقق من القيم الصالحة
+                if np.isnan(current_features[feature_name]) or np.isinf(current_features[feature_name]):
+                    current_features[feature_name] = 0.0
+            except:
+                current_features[feature_name] = 0.0
+        
+        # تحديث مصفوفات الميزات
+        for i in range(self.config.FEATURE_COUNT):
+            feature_name = f'f{i+1}'
+            self.feature_arrays[feature_name].append(current_features[feature_name])
+        
+        # حساب التسمية التدريبية (Training Label)
+        # y_train = src[4] < src[0] ? -1 : src[4] > src[0] ? 1 : 0
+        if current_idx >= 4:
+            try:
+                src_current = df['close'].iloc[current_idx]
+                src_future = df['close'].iloc[current_idx - 4]
+                
+                if src_future < src_current:
+                    label = -1  # short
+                elif src_future > src_current:
+                    label = 1   # long
+                else:
+                    label = 0   # neutral
+                
+                self.y_train_array.append(label)
+            except:
+                pass
+        
+        # خوارزمية Approximate Nearest Neighbors
+        self.predictions.clear()
+        self.distances.clear()
+        
+        last_distance = -1.0
+        size = min(self.config.MAX_BARS_BACK - 1, len(self.y_train_array) - 1)
+        
+        for i in range(0, size):
+            if i % 4 == 0:  # تباعد زمني كل 4 أشرطة
+                d = self.get_lorentzian_distance(i, current_features)
+                
+                if d >= last_distance:
+                    last_distance = d
+                    self.distances.append(d)
+                    if i < len(self.y_train_array):
+                        self.predictions.append(self.y_train_array[i])
+                    
+                    # الحفاظ على عدد الجيران المطلوب
+                    if len(self.predictions) > self.config.NEIGHBORS_COUNT:
+                        quartile_idx = int(self.config.NEIGHBORS_COUNT * 3 / 4)
+                        if quartile_idx < len(self.distances):
+                            last_distance = self.distances[quartile_idx]
+                        self.distances.pop(0)
+                        self.predictions.pop(0)
+        
+        # حساب التنبؤ النهائي
+        prediction = sum(self.predictions) if self.predictions else 0
+        
+        # تطبيق الفلاتر
+        filter_all = self.apply_filters(df, current_idx)
+        
+        # تحديد الإشارة
+        if prediction > 0 and filter_all:
+            signal = 1  # long
+        elif prediction < 0 and filter_all:
+            signal = -1  # short
+        else:
+            signal = 0  # neutral
+        
+        # حساب Kernel Regression
+        kernel_info = {'is_bullish': True, 'is_bearish': True}
+        
+        if self.config.USE_KERNEL_FILTER:
+            try:
+                yhat1 = self.rational_quadratic_kernel(
+                    df['close'],
+                    self.config.KERNEL_H,
+                    self.config.KERNEL_R,
+                    self.config.KERNEL_X
+                )
+                
+                if current_idx >= 1:
+                    is_bullish_rate = yhat1.iloc[current_idx] > yhat1.iloc[current_idx - 1]
+                    kernel_info['is_bullish'] = is_bullish_rate
+                    kernel_info['is_bearish'] = not is_bullish_rate
+            except:
+                pass
+        
+        # فلاتر EMA و SMA
+        ema_filter = True
+        sma_filter = True
+        
+        try:
+            if self.config.USE_EMA_FILTER:
+                ema_val = TechnicalIndicators.ema(df['close'], self.config.EMA_PERIOD)
+                current_price = df['close'].iloc[current_idx]
+                if signal == 1:
+                    ema_filter = current_price > ema_val.iloc[current_idx]
+                elif signal == -1:
+                    ema_filter = current_price < ema_val.iloc[current_idx]
+            
+            if self.config.USE_SMA_FILTER:
+                sma_val = TechnicalIndicators.sma(df['close'], self.config.SMA_PERIOD)
+                current_price = df['close'].iloc[current_idx]
+                if signal == 1:
+                    sma_filter = current_price > sma_val.iloc[current_idx]
+                elif signal == -1:
+                    sma_filter = current_price < sma_val.iloc[current_idx]
+        except:
+            pass
+        
+        # تطبيق جميع الفلاتر
+        if not (ema_filter and sma_filter):
+            signal = 0
+        
+        return signal, kernel_info
+
+
+# ============================================================================
+# واجهة cTrader API (مع وضع محاكاة)
+# ============================================================================
+
+class CTraderAPI:
+    """واجهة الاتصال بـ cTrader API"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.current_balance = self.config.INITIAL_BALANCE
+        self.current_position = None
+        self.trades_history = []
+        self.demo_mode = self.config.USE_DEMO_MODE
+        
+        logger.info(f"تم تهيئة CTrader API - الوضع: {'محاكاة' if self.demo_mode else 'حقيقي'}")
+    
+    def get_current_balance(self) -> float:
+        """الحصول على الرصيد الحالي"""
+        return self.current_balance
+    
+    def get_historical_data(self, bars: int = 2500) -> pd.DataFrame:
+        """جلب البيانات التاريخية"""
+        
+        if self.demo_mode:
+            # في الوضع التجريبي، نستخدم بيانات عشوائية واقعية
+            logger.info(f"جاري جلب {bars} شمعة (وضع محاكاة)...")
+            
+            dates = pd.date_range(end=datetime.now(), periods=bars, freq='1min')
+            np.random.seed(int(time.time()) % 10000)
+            
+            # محاكاة حركة السعر الواقعية
+            base_price = 1.1000
+            returns = np.random.normal(0, 0.00005, bars)  # تقلب واقعي
+            prices = base_price * (1 + returns).cumprod()
+            
+            df = pd.DataFrame({
+                'timestamp': dates,
+                'open': prices * (1 + np.random.uniform(-0.00005, 0.00005, bars)),
+                'high': prices * (1 + np.random.uniform(0, 0.0001, bars)),
+                'low': prices * (1 + np.random.uniform(-0.0001, 0, bars)),
+                'close': prices,
+                'volume': np.random.randint(100, 1000, bars)
+            })
+            
+            logger.info(f"تم جلب {len(df)} شمعة بنجاح")
+            return df
+        
+        else:
+            # في الوضع الحقيقي، استخدم API الفعلي
+            # هنا يجب إضافة كود الاتصال الفعلي بـ cTrader
+            logger.warning("الوضع الحقيقي غير مفعّل بعد - استخدم USE_DEMO_MODE = True")
+            return None
+    
+    def calculate_position_size(self) -> float:
+        """حساب حجم الصفقة بناءً على الرصيد الحالي"""
+        # حجم الصفقة = الرصيد × الرافعة المالية / 100,000
+        position_value = self.current_balance * self.config.LEVERAGE
+        lot_size = position_value / 100000
+        
+        # تطبيق الحد الأقصى
+        lot_size = min(lot_size, self.config.MAX_POSITION_SIZE)
+        
+        return round(lot_size, 2)
+    
+    def open_position(self, signal_type: str, current_price: float) -> bool:
+        """فتح صفقة جديدة"""
+        try:
+            # إغلاق الصفقة المعاكسة إذا كانت موجودة
+            if self.current_position:
+                opposite_type = 'sell' if signal_type == 'buy' else 'buy'
+                if self.current_position['type'] == opposite_type:
+                    self.close_position(current_price)
+            
+            # إذا كانت هناك صفقة من نفس النوع، لا نفعل شيء
+            if self.current_position and self.current_position['type'] == signal_type:
+                return False
+            
+            # حساب حجم الصفقة بناءً على الرصيد الحالي
+            volume = self.calculate_position_size()
+            
+            # فتح صفقة جديدة
+            self.current_position = {
+                'type': signal_type,
+                'volume': volume,
+                'open_price': current_price,
+                'open_time': datetime.now()
+            }
+            
+            logger.info(f"{'='*60}")
+            logger.info(f"🟢 تم فتح صفقة {signal_type.upper()}")
+            logger.info(f"   الحجم: {volume:.2f} لوت")
+            logger.info(f"   السعر: {current_price:.5f}")
+            logger.info(f"   الرصيد: ${self.current_balance:.2f}")
+            logger.info(f"{'='*60}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"خطأ في فتح الصفقة: {e}")
+            return False
+    
+    def close_position(self, current_price: float) -> bool:
+        """إغلاق الصفقة الحالية وحساب الربح/الخسارة"""
+        if not self.current_position:
+            return False
+        
+        try:
+            open_price = self.current_position['open_price']
+            volume = self.current_position['volume']
+            position_type = self.current_position['type']
+            
+            # حساب فرق السعر
+            if position_type == 'buy':
+                price_diff = current_price - open_price
+            else:  # sell
+                price_diff = open_price - current_price
+            
+            # حساب الربح/الخسارة
+            # الربح = فرق السعر × حجم الصفقة × 100,000 (حجم اللوت القياسي)
+            profit = price_diff * volume * 100000
+            
+            # تحديث الرصيد
+            old_balance = self.current_balance
+            self.current_balance += profit
+            
+            # حفظ في السجل
+            trade_record = {
+                'type': position_type,
+                'open_price': open_price,
+                'close_price': current_price,
+                'volume': volume,
+                'profit': profit,
+                'open_time': self.current_position['open_time'],
+                'close_time': datetime.now(),
+                'balance_before': old_balance,
+                'balance_after': self.current_balance
+            }
+            self.trades_history.append(trade_record)
+            
+            logger.info(f"{'='*60}")
+            logger.info(f"🔴 تم إغلاق صفقة {position_type.upper()}")
+            logger.info(f"   السعر عند الفتح: {open_price:.5f}")
+            logger.info(f"   السعر عند الإغلاق: {current_price:.5f}")
+            logger.info(f"   الحجم: {volume:.2f} لوت")
+            logger.info(f"   الربح/الخسارة: ${profit:+.2f}")
+            logger.info(f"   الرصيد السابق: ${old_balance:.2f}")
+            logger.info(f"   الرصيد الجديد: ${self.current_balance:.2f}")
+            logger.info(f"   التغير: {((self.current_balance/old_balance - 1) * 100):+.2f}%")
+            logger.info(f"{'='*60}")
+            
+            self.current_position = None
+            return True
+            
+        except Exception as e:
+            logger.error(f"خطأ في إغلاق الصفقة: {e}")
+            return False
+    
+    def get_statistics(self) -> Dict:
+        """إحصائيات التداول"""
+        if not self.trades_history:
+            return {
+                'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'win_rate': 0,
+                'total_profit': 0,
+                'total_loss': 0,
+                'net_profit': 0,
+                'profit_factor': 0
+            }
+        
+        winning_trades = [t for t in self.trades_history if t['profit'] > 0]
+        losing_trades = [t for t in self.trades_history if t['profit'] < 0]
+        
+        total_profit = sum(t['profit'] for t in winning_trades)
+        total_loss = abs(sum(t['profit'] for t in losing_trades))
+        
+        return {
+            'total_trades': len(self.trades_history),
+            'winning_trades': len(winning_trades),
+            'losing_trades': len(losing_trades),
+            'win_rate': len(winning_trades) / len(self.trades_history) * 100 if self.trades_history else 0,
+            'total_profit': total_profit,
+            'total_loss': total_loss,
+            'net_profit': self.current_balance - self.config.INITIAL_BALANCE,
+            'profit_factor': total_profit / total_loss if total_loss > 0 else 0
+        }
+
+
+# ============================================================================
+# البوت الرئيسي
+# ============================================================================
+
+class TradingBot:
+    """بوت التداول الرئيسي - يجمع كل شيء معاً"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.classifier = LorentzianClassifier()
+        self.api = CTraderAPI()
+        self.last_signal = 0
+        
+        logger.info("="*60)
+        logger.info("تم تهيئة بوت التداول بنجاح")
+        logger.info("="*60)
+    
+    def print_configuration(self):
+        """طباعة الإعدادات"""
+        logger.info("\n" + "="*60)
+        logger.info("⚙️  إعدادات البوت:")
+        logger.info("="*60)
+        logger.info(f"الرمز: {self.config.SYMBOL}")
+        logger.info(f"الإطار الزمني: {self.config.TIMEFRAME}")
+        logger.info(f"الرافعة المالية: 1:{self.config.LEVERAGE}")
+        logger.info(f"الرصيد الابتدائي: ${self.config.INITIAL_BALANCE:.2f}")
+        logger.info(f"استخدام الرصيد التراكمي: {'نعم' if self.config.USE_CUMULATIVE_BALANCE else 'لا'}")
+        logger.info(f"عدد الجيران: {self.config.NEIGHBORS_COUNT}")
+        logger.info(f"عدد الشموع التاريخية: {self.config.MAX_BARS_BACK}")
+        logger.info(f"عدد الميزات: {self.config.FEATURE_COUNT}")
+        logger.info(f"فلتر التقلب: {'مفعّل' if self.config.USE_VOLATILITY_FILTER else 'معطّل'}")
+        logger.info(f"فلتر النظام: {'مفعّل' if self.config.USE_REGIME_FILTER else 'معطّل'}")
+        logger.info(f"فلتر ADX: {'مفعّل' if self.config.USE_ADX_FILTER else 'معطّل'}")
+        logger.info(f"فلتر EMA: {'مفعّل' if self.config.USE_EMA_FILTER else 'معطّل'}")
+        logger.info(f"فلتر SMA: {'مفعّل' if self.config.USE_SMA_FILTER else 'معطّل'}")
+        logger.info(f"فلتر Kernel: {'مفعّل' if self.config.USE_KERNEL_FILTER else 'معطّل'}")
+        logger.info("="*60 + "\n")
+    
+    def run(self):
+        """حلقة التداول الرئيسية"""
+        self.print_configuration()
+        
+        logger.info("🚀 بدء حلقة التداول...")
+        logger.info(f"التحديث كل {self.config.UPDATE_INTERVAL_SECONDS} ثانية\n")
+        
+        iteration = 0
+        
+        try:
+            while True:
+                iteration += 1
+                
+                logger.info("\n" + "="*60)
+                logger.info(f"📊 التكرار #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info("="*60)
+                
+                # جلب البيانات التاريخية
+                df = self.api.get_historical_data(bars=self.config.MAX_BARS_BACK)
+                
+                if df is None or len(df) < 100:
+                    logger.warning("⚠️ بيانات غير كافية")
+                    time.sleep(self.config.UPDATE_INTERVAL_SECONDS)
+                    continue
+                
+                # الحصول على آخر شمعة
+                current_idx = len(df) - 1
+                current_price = df['close'].iloc[current_idx]
+                
+                # التنبؤ
+                signal, kernel_info = self.classifier.predict(df, current_idx)
+                
+                # معلومات الحساب
+                current_balance = self.api.get_current_balance()
+                
+                logger.info(f"💰 الرصيد الحالي: ${current_balance:.2f}")
+                logger.info(f"💱 السعر الحالي: {current_price:.5f}")
+                
+                signal_text = "شراء 🟢" if signal == 1 else "بيع 🔴" if signal == -1 else "محايد ⚪"
+                logger.info(f"🎯 الإشارة: {signal} ({signal_text})")
+                
+                # منطق التداول
+                is_new_buy_signal = signal == 1 and self.last_signal != 1
+                is_new_sell_signal = signal == -1 and self.last_signal != -1
+                
+                # فلاتر Kernel
+                is_bullish = kernel_info.get('is_bullish', True)
+                is_bearish = kernel_info.get('is_bearish', True)
+                
+                # تنفيذ الصفقات
+                if is_new_buy_signal and is_bullish:
+                    logger.info("✅ إشارة شراء جديدة مؤكدة!")
+                    self.api.open_position('buy', current_price)
+                    self.last_signal = 1
+                    
+                elif is_new_sell_signal and is_bearish:
+                    logger.info("✅ إشارة بيع جديدة مؤكدة!")
+                    self.api.open_position('sell', current_price)
+                    self.last_signal = -1
+                
+                else:
+                    if signal == 0:
+                        logger.info("⏸️  لا توجد إشارة واضحة - الانتظار...")
+                    else:
+                        logger.info(f"⏸️  الإشارة موجودة لكن لم تتغير - الاحتفاظ بالوضع الحالي")
+                
+                # عرض الصفقة الحالية
+                if self.api.current_position:
+                    pos = self.api.current_position
+                    unrealized_pnl = 0
+                    if pos['type'] == 'buy':
+                        unrealized_pnl = (current_price - pos['open_price']) * pos['volume'] * 100000
+                    else:
+                        unrealized_pnl = (pos['open_price'] - current_price) * pos['volume'] * 100000
+                    
+                    logger.info(f"\n📌 الصفقة المفتوحة:")
+                    logger.info(f"   النوع: {pos['type'].upper()}")
+                    logger.info(f"   الحجم: {pos['volume']:.2f} لوت")
+                    logger.info(f"   سعر الدخول: {pos['open_price']:.5f}")
+                    logger.info(f"   السعر الحالي: {current_price:.5f}")
+                    logger.info(f"   الربح/الخسارة غير المحقق: ${unrealized_pnl:+.2f}")
+                
+                # عرض الإحصائيات
+                if iteration % 10 == 0:  # كل 10 تكرارات
+                    stats = self.api.get_statistics()
+                    if stats['total_trades'] > 0:
+                        logger.info(f"\n📈 إحصائيات التداول:")
+                        logger.info(f"   إجمالي الصفقات: {stats['total_trades']}")
+                        logger.info(f"   صفقات رابحة: {stats['winning_trades']}")
+                        logger.info(f"   صفقات خاسرة: {stats['losing_trades']}")
+                        logger.info(f"   نسبة النجاح: {stats['win_rate']:.1f}%")
+                        logger.info(f"   صافي الربح: ${stats['net_profit']:+.2f}")
+                        logger.info(f"   معامل الربح: {stats['profit_factor']:.2f}")
+                
+                logger.info(f"\n⏳ الانتظار {self.config.UPDATE_INTERVAL_SECONDS} ثانية حتى التحديث التالي...")
+                time.sleep(self.config.UPDATE_INTERVAL_SECONDS)
+                
+        except KeyboardInterrupt:
+            logger.info("\n\n⚠️ تم إيقاف البوت بواسطة المستخدم")
+            self.shutdown()
+        except Exception as e:
+            logger.error(f"❌ خطأ في حلقة التداول: {e}", exc_info=True)
+            self.shutdown()
+    
+    def shutdown(self):
+        """إيقاف البوت بشكل آمن"""
+        logger.info("\n" + "="*60)
+        logger.info("🛑 جاري إيقاف البوت...")
+        logger.info("="*60)
+        
+        # إغلاق أي صفقات مفتوحة
+        if self.api.current_position:
+            df = self.api.get_historical_data(bars=10)
+            if df is not None:
+                current_price = df['close'].iloc[-1]
+                self.api.close_position(current_price)
+        
+        # طباعة الإحصائيات النهائية
+        stats = self.api.get_statistics()
+        current_balance = self.api.get_current_balance()
+        initial_balance = self.config.INITIAL_BALANCE
+        
+        logger.info("\n" + "="*60)
+        logger.info("📊 الإحصائيات النهائية:")
+        logger.info("="*60)
+        logger.info(f"الرصيد الابتدائي: ${initial_balance:.2f}")
+        logger.info(f"الرصيد النهائي: ${current_balance:.2f}")
+        logger.info(f"صافي الربح/الخسارة: ${current_balance - initial_balance:+.2f}")
+        logger.info(f"النسبة المئوية: {((current_balance/initial_balance - 1) * 100):+.2f}%")
+        logger.info(f"\nإجمالي الصفقات: {stats['total_trades']}")
+        logger.info(f"صفقات رابحة: {stats['winning_trades']}")
+        logger.info(f"صفقات خاسرة: {stats['losing_trades']}")
+        logger.info(f"نسبة النجاح: {stats['win_rate']:.1f}%")
+        
+        if stats['total_trades'] > 0:
+            logger.info(f"إجمالي الأرباح: ${stats['total_profit']:.2f}")
+            logger.info(f"إجمالي الخسائر: ${stats['total_loss']:.2f}")
+            logger.info(f"معامل الربح: {stats['profit_factor']:.2f}")
+        
+        logger.info("="*60)
+        logger.info("✅ تم إيقاف البوت بنجاح")
+        logger.info("="*60 + "\n")
+
+
+# ============================================================================
+# نقطة الدخول الرئيسية
+# ============================================================================
+
+def main():
+    """الدالة الرئيسية لتشغيل البوت"""
+    
+    print("\n" + "="*60)
+    print("🤖 Lorentzian Classification Trading Bot")
+    print("="*60)
+    print("تحويل من Pine Script إلى Python")
+    print("للتداول الآلي على cTrader")
+    print("="*60 + "\n")
+    
+    # التحقق من الإعدادات
+    config = Config()
+    
+    if config.CTRADER_CLIENT_ID == "your_client_id_here":
+        logger.warning("⚠️ تحذير: لم يتم تحديث بيانات API!")
+        logger.warning("⚠️ يرجى تحديث Config.CTRADER_CLIENT_ID و Config.CTRADER_CLIENT_SECRET")
+        logger.info("ℹ️ سيتم استخدام الوضع التجريبي (محاكاة)...")
+        config.USE_DEMO_MODE = True
+    
+    # إنشاء وتشغيل البوت
+    bot = TradingBot()
+    
+    try:
+        bot.run()
+    except Exception as e:
+        logger.error(f"خطأ فادح: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# ============================================================================
+# نهاية الكود
+# ============================================================================
